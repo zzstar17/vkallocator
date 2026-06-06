@@ -93,40 +93,64 @@ pub fn assign_memory_type_indexes_to_objects_for_allocation<const P: usize, cons
   }
 
   // count how many of each type the objects support
-  // index, count
-  let mut memory_type_counters = [(0, 0usize); vk::MAX_MEMORY_TYPES];
-  for i in 0..(data.mem_types.len()) {
-    memory_type_counters[i].0 = i;
-  }
+  let mut memory_type_counters = [0usize; vk::MAX_MEMORY_TYPES];
   for mask in object_masks {
     for i in 0..(data.mem_types.len()) {
       if mask & (1 << i) > 0 {
-        memory_type_counters[i].1 += 1
+        memory_type_counters[i] += 1
       }
     }
   }
-  // find the first memory types that have the most number of supported objects
-  // the sort is stable so memory types with the same count will conserve their order
-  memory_type_counters.sort_by_key(|&(_index, count)| count);
 
   let mut assigned = [usize::MAX; S];
   let mut remaining = S;
   let mut unique_type_count = 0;
-  for (mem_type_index, _count) in memory_type_counters {
-    unique_type_count += 1;
-    for (obj_i, obj_mask) in object_masks.iter().enumerate() {
-      // object unassigned and type is supported
-      if assigned[obj_i] == usize::MAX && obj_mask & (1 << mem_type_index) > 0 {
-        assigned[obj_i] = mem_type_index;
-        remaining -= 1;
+  // choose the first type with the highest amount of objects and add assign them
+  // repeat until all objects are assigned
+  while remaining > 0 {
+    // find first max
+    let mut cur_max = 0;
+    let mut max_i = usize::MAX;
+    for i in 0..(data.mem_types.len()) {
+      if memory_type_counters[i] > cur_max {
+        cur_max = memory_type_counters[i];
+        max_i = i;
       }
     }
-    if remaining == 0 {
-      break;
+    // assert that the chosen counter is actually valid
+    assert!(max_i != usize::MAX);
+    assert!(cur_max <= remaining);
+
+    unique_type_count += 1;
+
+    if cur_max == remaining {
+      // all remaining objects support this type
+      for (obj_i, _obj_mask) in object_masks.iter().enumerate() {
+        // object unassigned
+        if assigned[obj_i] == usize::MAX {
+          assigned[obj_i] = max_i;
+          remaining -= 1;
+        }
+      }
+    } else {
+      // assign all objects to type with index max_i if they support it
+      for (obj_i, obj_mask) in object_masks.iter().enumerate() {
+        // object unassigned and type is supported
+        if assigned[obj_i] == usize::MAX && obj_mask & (1 << max_i) > 0 {
+          assigned[obj_i] = max_i;
+
+          // remove from counters
+          for i in 0..(data.mem_types.len()) {
+            if obj_mask & (1 << i) > 0 {
+              memory_type_counters[i] -= 1
+            }
+          }
+
+          remaining -= 1;
+        }
+      }
     }
   }
-
-  assert!(remaining == 0);
 
   Ok((assigned, unique_type_count))
 }

@@ -229,7 +229,7 @@ pub fn display_mem_assignment_result<const P: usize, const S: usize>(
   match result {
     Ok((assigned, unique_type_count)) => {
       f.write_fmt(format_args!(
-        "\n\"{}\" ALLOCATION RESULT: SUCCESS\n{} object{} got assigned to {} unique memory type{}.\n",
+        "\n\"{}\" Allocation memory type assignment: SUCCESS\n{} object{} got assigned to {} unique memory type{}.\n",
         alloc_name,
         obj_reqs.len(),
         if obj_reqs.len() == 1 { "" } else { "s" },
@@ -247,7 +247,7 @@ pub fn display_mem_assignment_result<const P: usize, const S: usize>(
     }
     Err(err) => {
       f.write_fmt(format_args!(
-        "\n\"{}\" ALLOCATION RESULT: FAILURE\n",
+        "\n\"{}\" Allocation memory type assignment: FAILURE\n",
         alloc_name,
       ))?;
 

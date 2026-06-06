@@ -298,24 +298,22 @@ pub fn allocate_and_bind_memory<const P: usize, const S: usize>(
 pub fn map_host_visible_allocation<const S: usize>(
   device: &Device,
   allocation: AllocationSuccess<S>,
-) -> Result<[NonNull<u8>; S], MemoryMapError> {
-  let mut pointers = [ptr::null_mut(); S];
-  for (
-    i,
-    DetailedMemory {
-      memory,
-      type_index: _,
-      size: _,
-    },
-  ) in allocation.get_memories().iter().enumerate()
+) -> Result<Box<[NonNull<u8>]>, MemoryMapError> {
+  let mut pointers = Vec::with_capacity(allocation.memory_count);
+  for DetailedMemory {
+    memory,
+    type_index: _,
+    size: _,
+  } in allocation.get_memories()
   {
     let mem_ptr =
       unsafe { device.map_memory(*memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?
         as *mut u8;
-    pointers[i] = mem_ptr;
+    pointers
+      .push(NonNull::new(mem_ptr).expect("Vulkan device.map_memory() returned a null pointer"))
   }
 
-  Ok(pointers.map(|ptr| NonNull::new(ptr).unwrap()))
+  Ok(pointers.into_boxed_slice())
 }
 
 #[cfg(test)]
