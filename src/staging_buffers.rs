@@ -1,7 +1,4 @@
-use std::{
-  ops::BitOr,
-  ptr::{self, copy_nonoverlapping},
-};
+use std::{ops::BitOr, ptr::copy_nonoverlapping};
 
 use ash::vk;
 use vkinitialization::device::{Device, PhysicalDevice};
@@ -10,17 +7,17 @@ use vkobjects::{
   errors::{DeviceIsLost, OutOfMemoryError, QueueSubmitError},
 };
 
-use crate::{create_objs::create_buffer, utility::OnErr};
+use crate::{MemoryMapError, MemoryPlacement, create_objs::create_buffer, utility::OnErr};
 
-use super::{AllocationError, MemoryBound, MemoryWithType};
+use super::{AllocationError, MemoryBound};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceMemoryInitializationError {
-  #[error("Failed to allocate memory for staging buffers:\n{}", {1})]
+  #[error("Failed to allocate memory for staging buffers:\n{}", {0})]
   AllocationError(#[from] AllocationError),
-  #[error("Object to memory type assignment on staging buffers did not succeed")]
-  MemoryMapFailed,
-  #[error("Generic out of memory error not caused by a failed allocation ({})", {1})]
+  #[error("Failed to map staging buffers: {0}")]
+  MemoryMapFailed(#[from] MemoryMapError),
+  #[error("Generic out of memory error not caused by a failed allocation ({})", {0})]
   GenericOutOfMemory(#[from] OutOfMemoryError),
   #[error(transparent)]
   DeviceIsLost(#[from] DeviceIsLost),
@@ -32,7 +29,6 @@ impl From<vk::Result> for DeviceMemoryInitializationError {
       vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
         Self::GenericOutOfMemory(OutOfMemoryError::from(value))
       }
-      vk::Result::ERROR_MEMORY_MAP_FAILED => Self::MemoryMapFailed,
       vk::Result::ERROR_DEVICE_LOST => Self::DeviceIsLost(DeviceIsLost {}),
       _ => panic!("Unhandled vk::Result when converting to RecordMemoryInitializationFailedError"),
     }
@@ -122,41 +118,36 @@ pub unsafe fn create_single_use_staging_buffers<const S: usize>(
     staging_alloc.destroy_self(device);
   };
 
-  let mem_ptrs = {
-    let mut tmp = [ptr::null_mut(); S];
-    for (
-      i,
-      MemoryWithType {
-        memory,
-        type_index: _,
-      },
-    ) in staging_alloc.get_memories().iter().enumerate()
-    {
-      let mem_ptr = unsafe {device
-        .map_memory(*memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
-        .on_err(|_| destroy_created_objs())? as *mut u8;
-      tmp[i] = mem_ptr;
-    }
-    tmp
-  };
+  let mem_ptrs =
+    super::map_host_visible_allocation(device, staging_alloc).on_err(|_| destroy_created_objs())?;
 
-  for ((mem_i, offset), (ptr, size)) in staging_alloc
+  for (
+    MemoryPlacement {
+      memory_index,
+      memory_offset,
+    },
+    (ptr, size),
+  ) in staging_alloc
     .obj_to_memory_assignment
     .into_iter()
     .zip(data.into_iter())
   {
-    unsafe {copy_nonoverlapping(
-      ptr,
-      mem_ptrs[mem_i].byte_add(offset as usize),
-      size as usize,
-    )};
+    unsafe {
+      copy_nonoverlapping(
+        ptr,
+        mem_ptrs[memory_index]
+          .as_ptr()
+          .byte_add(memory_offset as usize),
+        size as usize,
+      )
+    };
   }
 
   // no explicit flushing: memory flushed implicitly on queue submit
 
   let memories = staging_alloc.memories.map(|m| m.memory);
   for &memory in &memories[0..staging_alloc.memory_count] {
-    unsafe {device.unmap_memory(memory)};
+    unsafe { device.unmap_memory(memory) };
   }
 
   Ok(SingleUseStagingBuffers {

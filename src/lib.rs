@@ -1,4 +1,9 @@
-use std::{ffi::c_void, marker::PhantomData, ops::Deref, ptr};
+use std::{
+  ffi::c_void,
+  marker::PhantomData,
+  ops::Deref,
+  ptr::{self, NonNull},
+};
 
 use ash::vk;
 use mem_type_assignment::{
@@ -29,12 +34,20 @@ use vkobjects::{
 };
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct MemoryWithType {
+pub struct DetailedMemory {
   pub memory: vk::DeviceMemory,
   pub type_index: usize,
+  pub size: u64,
 }
 
-impl Deref for MemoryWithType {
+/// Buffer and its mapped pointer
+#[derive(Debug, Clone, Copy)]
+pub struct MappedHostBuffer<T> {
+  pub buffer: vk::Buffer,
+  pub data_ptr: ptr::NonNull<T>,
+}
+
+impl Deref for DetailedMemory {
   type Target = vk::DeviceMemory;
 
   fn deref(&self) -> &Self::Target {
@@ -42,7 +55,7 @@ impl Deref for MemoryWithType {
   }
 }
 
-impl DeviceManuallyDestroyed for MemoryWithType {
+impl DeviceManuallyDestroyed for DetailedMemory {
   unsafe fn destroy_self(&self, device: &ash::Device) {
     unsafe {
       self.memory.destroy_self(device);
@@ -51,15 +64,21 @@ impl DeviceManuallyDestroyed for MemoryWithType {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct MemoryPlacement {
+  memory_index: usize,
+  memory_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct AllocationSuccess<const S: usize> {
-  pub memories: [MemoryWithType; vk::MAX_MEMORY_TYPES],
+  pub memories: [DetailedMemory; vk::MAX_MEMORY_TYPES],
   pub memory_count: usize,
   // memory index, offset
-  pub obj_to_memory_assignment: [(usize, u64); S],
+  pub obj_to_memory_assignment: [MemoryPlacement; S],
 }
 
 impl<const S: usize> AllocationSuccess<S> {
-  pub fn get_memories(&self) -> &[MemoryWithType] {
+  pub fn get_memories(&self) -> &[DetailedMemory] {
     &self.memories[0..self.memory_count]
   }
 }
@@ -78,6 +97,32 @@ pub enum AllocationError {
   AssignmentError(#[from] MemoryAssignmentError),
   #[error(transparent)]
   OutOfMemoryError(#[from] OutOfMemoryError),
+}
+
+#[derive(Debug, thiserror::Error, Clone, Copy)]
+pub enum MemoryMapError {
+  #[error("Vulkan returned VK_ERROR_MEMORY_MAP_FAILED")]
+  MemoryMapFailed,
+  #[error(transparent)]
+  OutOfMemoryError(#[from] OutOfMemoryError),
+  #[error("Vulkan returned VK_ERROR_UNKNOWN")]
+  Unknown,
+  #[error("Vulkan returned VK_ERROR_VALIDATION_FAILED")]
+  ValidationFailed,
+}
+
+impl From<vk::Result> for MemoryMapError {
+  fn from(value: vk::Result) -> Self {
+    match value {
+      vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+        Self::OutOfMemoryError(OutOfMemoryError::from(value))
+      }
+      vk::Result::ERROR_MEMORY_MAP_FAILED => Self::MemoryMapFailed,
+      vk::Result::ERROR_UNKNOWN => Self::Unknown,
+      vk::Result::ERROR_VALIDATION_FAILED_EXT => Self::ValidationFailed,
+      _ => panic!("Unhandled vk::Result when converting to MemoryMapError"),
+    }
+  }
 }
 
 // todo: not checking heap capacity, maxMemoryAllocationSize
@@ -141,10 +186,14 @@ pub fn allocate_memory<const P: usize, const S: usize>(
   debug_assert_eq!(working_memory_types_size, unique_type_ixs_count);
 
   // mem index, offset
-  let mut allocation_result = [(usize::MAX, u64::MAX); S];
-  let mut memories = [MemoryWithType {
+  let mut allocation_result = [MemoryPlacement {
+    memory_index: usize::MAX,
+    memory_offset: u64::MAX,
+  }; S];
+  let mut memories = [DetailedMemory {
     memory: vk::DeviceMemory::null(),
     type_index: usize::MAX,
+    size: 0,
   }; vk::MAX_MEMORY_TYPES];
   for (mem_i, &type_i) in working_memory_types[0..working_memory_types_size]
     .iter()
@@ -155,7 +204,7 @@ pub fn allocate_memory<const P: usize, const S: usize>(
       if assigned[i] == type_i {
         let offset: u64 = utility::round_up_to_power_of_2_u64(total_size, obj_reqs[i].alignment);
         total_size = offset + obj_reqs[i].size;
-        allocation_result[i].1 = offset;
+        allocation_result[i].memory_offset = offset;
       }
     }
 
@@ -188,14 +237,15 @@ pub fn allocate_memory<const P: usize, const S: usize>(
         (loader.fp().set_device_memory_priority_ext)(device.handle(), memory, priority);
       }
     }
-    memories[mem_i] = MemoryWithType {
+    memories[mem_i] = DetailedMemory {
       memory,
       type_index: type_i,
+      size: total_size,
     };
 
     for i in 0..S {
       if assigned[i] == type_i {
-        allocation_result[i].0 = mem_i;
+        allocation_result[i].memory_index = mem_i;
       }
     }
   }
@@ -229,15 +279,43 @@ pub fn allocate_and_bind_memory<const P: usize, const S: usize>(
   )?;
   let memories = alloc.get_memories();
 
-  for (i, &(mem_index, offset)) in alloc.obj_to_memory_assignment.iter().enumerate() {
+  for (i, &placement) in alloc.obj_to_memory_assignment.iter().enumerate() {
     unsafe {
       objs[i]
-        .bind(device, *memories[mem_index], offset)
+        .bind(
+          device,
+          *memories[placement.memory_index],
+          placement.memory_offset,
+        )
         .on_err(|_| alloc.destroy_self(device))?;
     }
   }
 
   Ok(alloc)
+}
+
+/// allocation must have had the HOST_VISIBLE property flag
+pub fn map_host_visible_allocation<const S: usize>(
+  device: &Device,
+  allocation: AllocationSuccess<S>,
+) -> Result<[NonNull<u8>; S], MemoryMapError> {
+  let mut pointers = [ptr::null_mut(); S];
+  for (
+    i,
+    DetailedMemory {
+      memory,
+      type_index: _,
+      size: _,
+    },
+  ) in allocation.get_memories().iter().enumerate()
+  {
+    let mem_ptr =
+      unsafe { device.map_memory(*memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?
+        as *mut u8;
+    pointers[i] = mem_ptr;
+  }
+
+  Ok(pointers.map(|ptr| NonNull::new(ptr).unwrap()))
 }
 
 #[cfg(test)]
