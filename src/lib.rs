@@ -63,10 +63,10 @@ impl DeviceManuallyDestroyed for DetailedMemory {
   }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryPlacement {
-  memory_index: usize,
-  memory_offset: u64,
+  pub memory_index: usize,
+  pub memory_offset: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
