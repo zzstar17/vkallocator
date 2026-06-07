@@ -47,6 +47,29 @@ pub struct MappedHostBuffer<T> {
   pub data_ptr: ptr::NonNull<T>,
 }
 
+impl<T> DeviceManuallyDestroyed for MappedHostBuffer<T> {
+  unsafe fn destroy_self(&self, device: &ash::Device) {
+    unsafe {
+      self.buffer.destroy_self(device);
+    }
+  }
+}
+
+/// Image and its mapped pointer
+#[derive(Debug, Clone, Copy)]
+pub struct MappedHostImage<T> {
+  pub image: vk::Image,
+  pub data_ptr: ptr::NonNull<T>,
+}
+
+impl<T> DeviceManuallyDestroyed for MappedHostImage<T> {
+  unsafe fn destroy_self(&self, device: &ash::Device) {
+    unsafe {
+      self.image.destroy_self(device);
+    }
+  }
+}
+
 impl Deref for DetailedMemory {
   type Target = vk::DeviceMemory;
 
@@ -298,22 +321,32 @@ pub fn allocate_and_bind_memory<const P: usize, const S: usize>(
 pub fn map_host_visible_allocation<const S: usize>(
   device: &Device,
   allocation: AllocationSuccess<S>,
-) -> Result<Box<[NonNull<u8>]>, MemoryMapError> {
-  let mut pointers = Vec::with_capacity(allocation.memory_count);
-  for DetailedMemory {
-    memory,
-    type_index: _,
-    size: _,
-  } in allocation.get_memories()
-  {
+) -> Result<[NonNull<u8>; S], MemoryMapError> {
+  let mut pointers = [NonNull::dangling(); S];
+  let mut assigned_count = 0;
+  for (cur_memory_i, memory) in allocation.get_memories().iter().enumerate() {
     let mem_ptr =
-      unsafe { device.map_memory(*memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?
+      unsafe { device.map_memory(**memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?
         as *mut u8;
-    pointers
-      .push(NonNull::new(mem_ptr).expect("Vulkan device.map_memory() returned a null pointer"))
+
+    for (
+      obj_i,
+      &MemoryPlacement {
+        memory_index: obj_memory_i,
+        memory_offset,
+      },
+    ) in allocation.obj_to_memory_assignment.iter().enumerate()
+    {
+      if cur_memory_i == obj_memory_i {
+        pointers[obj_i] = NonNull::new(unsafe { mem_ptr.byte_add(memory_offset as usize) })
+          .expect("Vulkan device.map_memory() returned a null pointer");
+        assigned_count += 1;
+      }
+    }
+    assert_eq!(assigned_count, S);
   }
 
-  Ok(pointers.into_boxed_slice())
+  Ok(pointers)
 }
 
 #[cfg(test)]
