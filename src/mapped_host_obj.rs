@@ -5,6 +5,7 @@ use std::{
 };
 
 use ash::vk::{self, Handle};
+use vkinitialization::device::PhysicalDevice;
 use vkobjects::{DeviceManuallyDestroyed, errors::OutOfMemoryError};
 
 use crate::{AllocationSuccess, DetailedMemory, MemoryBound, memory_bound::MemoryBoundType};
@@ -48,9 +49,9 @@ pub struct MappedHostObject {
 }
 
 impl MappedHostObject {
-  pub fn from_allocation<const P: usize, const S: usize>(
+  pub fn from_allocation<const S: usize>(
+    physical_device: &PhysicalDevice,
     allocation: &AllocationSuccess<S>,
-    mem_props: [vk::MemoryPropertyFlags; P],
     objs: &[&dyn MemoryBound; S],
     mapped_ptrs: [NonNull<u8>; S],
   ) -> [Self; S] {
@@ -66,6 +67,7 @@ impl MappedHostObject {
     };
     let mut result = [default; S];
 
+    let memory_types = physical_device.memory_types();
     let memories = allocation.get_memories();
     for (i, memory_placement) in allocation.obj_to_memory_assignment.iter().enumerate() {
       let DetailedMemory {
@@ -73,10 +75,21 @@ impl MappedHostObject {
         type_index,
         size: _mem_size,
       } = memories[memory_placement.memory_index];
-      debug_assert!(mem_props[type_index].contains(vk::MemoryPropertyFlags::HOST_VISIBLE));
+      debug_assert!(
+        memory_types[type_index]
+          .property_flags
+          .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+      );
 
-      let mem_host_coherent =
-        mem_props[type_index].contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+      let mem_host_coherent = memory_types[type_index]
+        .property_flags
+        .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+
+      if mem_host_coherent {
+        let atom_size = physical_device.properties.p10.limits.non_coherent_atom_size;
+        assert_eq!((memory_placement.memory_offset & atom_size as u64 - 1), 0);
+        assert_eq!((memory_placement.object_size & atom_size as u64 - 1), 0);
+      }
 
       let obj = Self {
         handle: objs[i].object_handle(),

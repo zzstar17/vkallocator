@@ -356,7 +356,7 @@ pub fn allocate_and_map_host_memory<const P: usize, const S: usize>(
   )?;
 
   let mapped_ptrs = map_host_visible_allocation(device, &alloc)?;
-  let objects = MappedHostObject::from_allocation(&alloc, mem_props, &objs, mapped_ptrs);
+  let objects = MappedHostObject::from_allocation(physical_device, &alloc, &objs, mapped_ptrs);
 
   Ok((alloc, objects))
 }
