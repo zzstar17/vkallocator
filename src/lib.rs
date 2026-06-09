@@ -19,7 +19,7 @@ mod mem_type_assignment;
 mod memory_bound;
 mod staging_buffers;
 
-pub use mapped_host_obj::{MappedHostBuffer, MappedHostImage};
+pub use mapped_host_obj::{HostMemorySyncError, MappedHostBuffer, MappedHostImage};
 pub use memory_bound::MemoryBound;
 pub use staging_buffers::{
   DeviceMemoryInitializationError, SingleUseStagingBuffers, create_single_use_staging_buffers,

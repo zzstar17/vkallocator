@@ -1,5 +1,6 @@
 use std::{
   assert_matches,
+  ops::Deref,
   ptr::{self, NonNull},
 };
 
@@ -155,11 +156,21 @@ pub struct MappedHostBuffer<T> {
 
 impl<T> MappedHostBuffer<T> {
   pub unsafe fn copy_to_buffer_memory(&self, src: &[T]) {
+    debug_assert!(self.buffer_size as usize >= size_of::<T>() * src.len());
     unsafe { ptr::copy_nonoverlapping(src.as_ptr(), self.data_ptr.as_ptr(), src.len()) };
   }
 
   pub unsafe fn copy_to_buffer_memory_ptr(&self, src: *const u8, size_bytes: usize) {
+    debug_assert!(self.buffer_size as usize >= size_bytes);
     unsafe { ptr::copy_nonoverlapping(src, self.data_ptr.as_ptr() as *mut u8, size_bytes) };
+  }
+
+  pub unsafe fn read_to_box(&self, count: usize) -> Box<[T]> {
+    let mut values = Box::<[T]>::new_uninit_slice(count);
+    unsafe {
+      ptr::copy_nonoverlapping(self.data_ptr.as_ptr(), values.as_mut_ptr() as *mut T, count);
+      values.assume_init()
+    }
   }
 
   pub fn memory_range(&self) -> vk::MappedMemoryRange<'_> {
@@ -192,6 +203,13 @@ impl<T> MappedHostBuffer<T> {
       }
     }
     Ok(())
+  }
+}
+
+impl<T> Deref for MappedHostBuffer<T> {
+  type Target = vk::Buffer;
+  fn deref(&self) -> &Self::Target {
+    &self.buffer
   }
 }
 
@@ -256,6 +274,13 @@ impl MappedHostImage {
       }
     }
     Ok(())
+  }
+}
+
+impl Deref for MappedHostImage {
+  type Target = vk::Image;
+  fn deref(&self) -> &Self::Target {
+    &self.image
   }
 }
 
