@@ -14,10 +14,12 @@ use mem_type_assignment::{
 mod create_objs;
 #[cfg(feature = "log_alloc")]
 mod logging;
+mod mapped_host_obj;
 mod mem_type_assignment;
 mod memory_bound;
 mod staging_buffers;
 
+pub use mapped_host_obj::{MappedHostBuffer, MappedHostImage};
 pub use memory_bound::MemoryBound;
 pub use staging_buffers::{
   DeviceMemoryInitializationError, SingleUseStagingBuffers, create_single_use_staging_buffers,
@@ -33,41 +35,13 @@ use vkobjects::{
   utility::{self, OnErr},
 };
 
+use crate::mapped_host_obj::MappedHostObject;
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DetailedMemory {
   pub memory: vk::DeviceMemory,
   pub type_index: usize,
   pub size: u64,
-}
-
-/// Buffer and its mapped pointer
-#[derive(Debug, Clone, Copy)]
-pub struct MappedHostBuffer<T> {
-  pub buffer: vk::Buffer,
-  pub data_ptr: ptr::NonNull<T>,
-}
-
-impl<T> DeviceManuallyDestroyed for MappedHostBuffer<T> {
-  unsafe fn destroy_self(&self, device: &ash::Device) {
-    unsafe {
-      self.buffer.destroy_self(device);
-    }
-  }
-}
-
-/// Image and its mapped pointer
-#[derive(Debug, Clone, Copy)]
-pub struct MappedHostImage<T> {
-  pub image: vk::Image,
-  pub data_ptr: ptr::NonNull<T>,
-}
-
-impl<T> DeviceManuallyDestroyed for MappedHostImage<T> {
-  unsafe fn destroy_self(&self, device: &ash::Device) {
-    unsafe {
-      self.image.destroy_self(device);
-    }
-  }
 }
 
 impl Deref for DetailedMemory {
@@ -89,7 +63,8 @@ impl DeviceManuallyDestroyed for DetailedMemory {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryPlacement {
   pub memory_index: usize,
-  pub memory_offset: u64,
+  pub memory_offset: vk::DeviceSize,
+  pub object_size: vk::DeviceSize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +95,20 @@ pub enum AllocationError {
   AssignmentError(#[from] MemoryAssignmentError),
   #[error(transparent)]
   OutOfMemoryError(#[from] OutOfMemoryError),
+  #[error("Vulkan returned VK_ERROR_UNKNOWN")]
+  Unknown,
+  #[error("Vulkan returned VK_ERROR_VALIDATION_FAILED")]
+  ValidationFailed,
+}
+
+#[derive(Debug, thiserror::Error, Clone, Copy)]
+pub enum HostAllocationError {
+  #[error("Not all memory properties have the HOST_VISIBLE bit set")]
+  NoHostVisibleBit,
+  #[error(transparent)]
+  MemoryMapError(#[from] MemoryMapError),
+  #[error(transparent)]
+  AllocationError(#[from] AllocationError),
 }
 
 #[derive(Debug, thiserror::Error, Clone, Copy)]
@@ -148,6 +137,10 @@ impl From<vk::Result> for MemoryMapError {
   }
 }
 
+fn is_power_of_2(x: u64) -> bool {
+  (x & (x - 1)) == 0
+}
+
 // todo: not checking heap capacity, maxMemoryAllocationSize
 // (https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_AMD_memory_overallocation_behavior.html)
 pub fn allocate_memory<const P: usize, const S: usize>(
@@ -156,11 +149,24 @@ pub fn allocate_memory<const P: usize, const S: usize>(
   mem_props: [vk::MemoryPropertyFlags; P],
   objs: [&dyn MemoryBound; S],
   priority: f32, // only set if VK_EXT_memory_priority is enabled
+  align_objects_to_non_coherent_atom_size: bool,
   #[cfg(feature = "log_alloc")] obj_labels: Option<[&'static str; S]>,
   #[cfg(feature = "log_alloc")] allocation_name: &str,
 ) -> Result<AllocationSuccess<S>, AllocationError> {
   let mem_types = physical_device.memory_types();
-  let obj_reqs = unsafe { objs.map(|obj| obj.get_memory_requirements(device)) };
+  let mut obj_reqs = unsafe { objs.map(|obj| obj.get_memory_requirements(device)) };
+
+  for req in obj_reqs {
+    debug_assert!(is_power_of_2(req.alignment));
+  }
+  if align_objects_to_non_coherent_atom_size {
+    let atom_size = physical_device.properties.p10.limits.non_coherent_atom_size;
+    debug_assert!(is_power_of_2(atom_size));
+    for req in obj_reqs.iter_mut() {
+      req.alignment = req.alignment.max(atom_size);
+      req.size = utility::round_up_to_power_of_2_u64(req.size, atom_size);
+    }
+  }
 
   let assign_result =
     assign_memory_type_indexes_to_objects_for_allocation(UnassignedToMemoryObjectsData {
@@ -212,6 +218,7 @@ pub fn allocate_memory<const P: usize, const S: usize>(
   let mut allocation_result = [MemoryPlacement {
     memory_index: usize::MAX,
     memory_offset: u64::MAX,
+    object_size: 0,
   }; S];
   let mut memories = [DetailedMemory {
     memory: vk::DeviceMemory::null(),
@@ -228,11 +235,12 @@ pub fn allocate_memory<const P: usize, const S: usize>(
         let offset: u64 = utility::round_up_to_power_of_2_u64(total_size, obj_reqs[i].alignment);
         total_size = offset + obj_reqs[i].size;
         allocation_result[i].memory_offset = offset;
+        allocation_result[i].object_size = obj_reqs[i].size;
       }
     }
 
     // todo: this probably would require dividing the allocations
-    assert!(total_size <= physical_device.properties.max_memory_allocation_size);
+    assert!(total_size <= physical_device.properties.p11.max_memory_allocation_size);
 
     let mut allocate_info = vk::MemoryAllocateInfo {
       s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
@@ -286,6 +294,7 @@ pub fn allocate_and_bind_memory<const P: usize, const S: usize>(
   mem_props: [vk::MemoryPropertyFlags; P],
   objs: [&dyn MemoryBound; S],
   priority: f32, // only set if VK_EXT_memory_priority is enabled
+  align_objects_to_non_coherent_atom_size: bool,
   #[cfg(feature = "log_alloc")] obj_labels: Option<[&'static str; S]>,
   #[cfg(feature = "log_alloc")] allocation_name: &str,
 ) -> Result<AllocationSuccess<S>, AllocationError> {
@@ -295,6 +304,7 @@ pub fn allocate_and_bind_memory<const P: usize, const S: usize>(
     mem_props,
     objs,
     priority,
+    align_objects_to_non_coherent_atom_size,
     #[cfg(feature = "log_alloc")]
     obj_labels,
     #[cfg(feature = "log_alloc")]
@@ -317,10 +327,44 @@ pub fn allocate_and_bind_memory<const P: usize, const S: usize>(
   Ok(alloc)
 }
 
+pub fn allocate_and_map_host_memory<const P: usize, const S: usize>(
+  device: &Device,
+  physical_device: &PhysicalDevice,
+  mem_props: [vk::MemoryPropertyFlags; P],
+  objs: [&dyn MemoryBound; S],
+  priority: f32, // only set if VK_EXT_memory_priority is enabled
+  #[cfg(feature = "log_alloc")] obj_labels: Option<[&'static str; S]>,
+  #[cfg(feature = "log_alloc")] allocation_name: &str,
+) -> Result<(AllocationSuccess<S>, [MappedHostObject; S]), HostAllocationError> {
+  for prop in mem_props {
+    if !prop.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+      return Err(HostAllocationError::NoHostVisibleBit);
+    }
+  }
+
+  let alloc = allocate_and_bind_memory(
+    device,
+    physical_device,
+    mem_props,
+    objs,
+    priority,
+    true,
+    #[cfg(feature = "log_alloc")]
+    obj_labels,
+    #[cfg(feature = "log_alloc")]
+    allocation_name,
+  )?;
+
+  let mapped_ptrs = map_host_visible_allocation(device, &alloc)?;
+  let objects = MappedHostObject::from_allocation(&alloc, mem_props, &objs, mapped_ptrs);
+
+  Ok((alloc, objects))
+}
+
 /// allocation must have had the HOST_VISIBLE property flag
 pub fn map_host_visible_allocation<const S: usize>(
   device: &Device,
-  allocation: AllocationSuccess<S>,
+  allocation: &AllocationSuccess<S>,
 ) -> Result<[NonNull<u8>; S], MemoryMapError> {
   let mut pointers = [NonNull::dangling(); S];
   let mut assigned_count = 0;
@@ -334,6 +378,7 @@ pub fn map_host_visible_allocation<const S: usize>(
       &MemoryPlacement {
         memory_index: obj_memory_i,
         memory_offset,
+        object_size: _object_size,
       },
     ) in allocation.obj_to_memory_assignment.iter().enumerate()
     {
@@ -351,5 +396,5 @@ pub fn map_host_visible_allocation<const S: usize>(
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+  // use super::*;
 }

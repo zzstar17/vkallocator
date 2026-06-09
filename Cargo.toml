@@ -1,6 +1,6 @@
 [package]
 name = "vkallocator"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -8,7 +8,7 @@ ash = "0.38.0"
 log = "0.4.29"
 thiserror = "2.0.18"
 vkobjects = { git = "https://github.com/zzstar17/vkobjects" }
-vkinitialization = { version = "0.1.5", git = "https://github.com/zzstar17/vkinitialization", default-features = false, features = [
+vkinitialization = { version = "0.1.9", git = "https://github.com/zzstar17/vkinitialization", default-features = false, features = [
     "graphics_family",
     "transfer_family",
 ] }

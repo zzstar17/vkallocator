@@ -1,4 +1,4 @@
-use std::{ops::BitOr, ptr::copy_nonoverlapping};
+use std::ops::BitOr;
 
 use ash::vk;
 use vkinitialization::device::{Device, PhysicalDevice};
@@ -7,16 +7,21 @@ use vkobjects::{
   errors::{DeviceIsLost, OutOfMemoryError, QueueSubmitError},
 };
 
-use crate::{MemoryMapError, MemoryPlacement, create_objs::create_buffer, utility::OnErr};
+use crate::{
+  HostAllocationError, MemoryMapError, create_objs::create_buffer,
+  mapped_host_obj::HostMemorySyncError, utility::OnErr,
+};
 
-use super::{AllocationError, MemoryBound};
+use super::MemoryBound;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceMemoryInitializationError {
   #[error("Failed to allocate memory for staging buffers:\n{}", {0})]
-  AllocationError(#[from] AllocationError),
+  AllocationError(#[from] HostAllocationError),
   #[error("Failed to map staging buffers: {0}")]
   MemoryMapFailed(#[from] MemoryMapError),
+  #[error("Failed to flush memory. {0}")]
+  MemoryFlushFailed(#[from] HostMemorySyncError),
   #[error("Generic out of memory error not caused by a failed allocation ({})", {0})]
   GenericOutOfMemory(#[from] OutOfMemoryError),
   #[error(transparent)]
@@ -95,7 +100,7 @@ pub unsafe fn create_single_use_staging_buffers<const S: usize>(
     tmp
   };
 
-  let staging_alloc = super::allocate_and_bind_memory(
+  let (staging_alloc, host_objects) = super::allocate_and_map_host_memory(
     device,
     physical_device,
     [
@@ -118,32 +123,15 @@ pub unsafe fn create_single_use_staging_buffers<const S: usize>(
     staging_alloc.destroy_self(device);
   };
 
-  let mem_ptrs =
-    super::map_host_visible_allocation(device, staging_alloc).on_err(|_| destroy_created_objs())?;
-
-  for (
-    MemoryPlacement {
-      memory_index,
-      memory_offset,
-    },
-    (ptr, size),
-  ) in staging_alloc
-    .obj_to_memory_assignment
-    .into_iter()
-    .zip(data.into_iter())
-  {
+  for (mapped_obj, (ptr, size)) in host_objects.into_iter().zip(data.into_iter()) {
+    let buffer_obj: crate::MappedHostBuffer<u8> = mapped_obj.into_buffer();
     unsafe {
-      copy_nonoverlapping(
-        ptr,
-        mem_ptrs[memory_index]
-          .as_ptr()
-          .byte_add(memory_offset as usize),
-        size as usize,
-      )
+      buffer_obj.copy_to_buffer_memory_ptr(ptr, size as usize);
+      buffer_obj
+        .flush_memory_range(device)
+        .on_err(|_err| destroy_created_objs())?;
     };
   }
-
-  // no explicit flushing: memory flushed implicitly on queue submit
 
   let memories = staging_alloc.memories.map(|m| m.memory);
   for &memory in &memories[0..staging_alloc.memory_count] {
