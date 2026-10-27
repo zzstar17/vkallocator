@@ -67,21 +67,21 @@ pub struct MemoryPlacement {
   pub object_size: vk::DeviceSize,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct AllocationSuccess<const S: usize> {
+#[derive(Debug, Clone)]
+pub struct AllocationSuccess {
   pub memories: [DetailedMemory; vk::MAX_MEMORY_TYPES],
   pub memory_count: usize,
   // memory index, offset
-  pub obj_to_memory_assignment: [MemoryPlacement; S],
+  pub obj_to_memory_assignment: Vec<MemoryPlacement>,
 }
 
-impl<const S: usize> AllocationSuccess<S> {
+impl AllocationSuccess {
   pub fn get_memories(&self) -> &[DetailedMemory] {
     &self.memories[0..self.memory_count]
   }
 }
 
-impl<const S: usize> DeviceManuallyDestroyed for AllocationSuccess<S> {
+impl DeviceManuallyDestroyed for AllocationSuccess {
   unsafe fn destroy_self(&self, device: &ash::Device) {
     unsafe {
       self.get_memories().destroy_self(device);
@@ -143,20 +143,24 @@ fn is_power_of_2(x: u64) -> bool {
 
 // todo: not checking heap capacity, maxMemoryAllocationSize
 // (https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_AMD_memory_overallocation_behavior.html)
-pub fn allocate_memory<const P: usize, const S: usize>(
+pub fn allocate_memory<const P: usize>(
   device: &Device,
   physical_device: &PhysicalDevice,
   mem_props: [vk::MemoryPropertyFlags; P],
-  objs: [&dyn MemoryBound; S],
+  obj_reqs: &mut [vk::MemoryRequirements],
   priority: f32, // only set if VK_EXT_memory_priority is enabled
   align_objects_to_non_coherent_atom_size: bool,
-  #[cfg(feature = "log_alloc")] obj_labels: Option<[&'static str; S]>,
+  #[cfg(feature = "log_alloc")] obj_labels: Option<&[&'static str]>,
   #[cfg(feature = "log_alloc")] allocation_name: &str,
-) -> Result<AllocationSuccess<S>, AllocationError> {
-  let mem_types = physical_device.memory_types();
-  let mut obj_reqs = unsafe { objs.map(|obj| obj.get_memory_requirements(device)) };
+) -> Result<AllocationSuccess, AllocationError> {
+  #[cfg(feature = "log_alloc")]
+  if let Some(labels) = obj_labels {
+    assert_eq!(obj_reqs.len(), labels.len());
+  }
 
-  for req in obj_reqs {
+  let mem_types = physical_device.memory_types();
+
+  for req in obj_reqs.iter() {
     debug_assert!(is_power_of_2(req.alignment));
   }
   if align_objects_to_non_coherent_atom_size {
@@ -179,19 +183,15 @@ pub fn allocate_memory<const P: usize, const S: usize>(
 
   #[cfg(feature = "log_alloc")]
   {
-    let labels: Option<&[&str]> = match &obj_labels {
-      Some(labels_arr) => Some(labels_arr.as_slice()),
-      None => None,
-    };
     let mut output = String::new();
-    logging::display_mem_assignment_result::<P, S>(
+    logging::display_mem_assignment_result::<P>(
       &mut output,
-      assign_result,
+      &assign_result,
       allocation_name,
       mem_types,
       &mem_props,
       &obj_reqs,
-      labels,
+      obj_labels,
     )
     .unwrap();
     let _ = output.pop(); // remove last \n
@@ -206,7 +206,7 @@ pub fn allocate_memory<const P: usize, const S: usize>(
 
   let mut working_memory_types = [usize::MAX; vk::MAX_MEMORY_TYPES];
   let mut working_memory_types_size = 0;
-  for type_i in assigned {
+  for &type_i in assigned.iter() {
     if !working_memory_types[0..working_memory_types_size].contains(&type_i) {
       working_memory_types[working_memory_types_size] = type_i;
       working_memory_types_size += 1;
@@ -215,11 +215,14 @@ pub fn allocate_memory<const P: usize, const S: usize>(
   debug_assert_eq!(working_memory_types_size, unique_type_ixs_count);
 
   // mem index, offset
-  let mut allocation_result = [MemoryPlacement {
-    memory_index: usize::MAX,
-    memory_offset: u64::MAX,
-    object_size: 0,
-  }; S];
+  let mut allocation_result = vec![
+    MemoryPlacement {
+      memory_index: usize::MAX,
+      memory_offset: u64::MAX,
+      object_size: 0,
+    };
+    obj_reqs.len()
+  ];
   let mut memories = [DetailedMemory {
     memory: vk::DeviceMemory::null(),
     type_index: usize::MAX,
@@ -230,7 +233,7 @@ pub fn allocate_memory<const P: usize, const S: usize>(
     .enumerate()
   {
     let mut total_size = 0;
-    for i in 0..S {
+    for i in 0..allocation_result.len() {
       if assigned[i] == type_i {
         let offset: u64 = utility::round_up_to_power_of_2_u64(total_size, obj_reqs[i].alignment);
         total_size = offset + obj_reqs[i].size;
@@ -274,7 +277,7 @@ pub fn allocate_memory<const P: usize, const S: usize>(
       size: total_size,
     };
 
-    for i in 0..S {
+    for i in 0..allocation_result.len() {
       if assigned[i] == type_i {
         allocation_result[i].memory_index = mem_i;
       }
@@ -288,21 +291,24 @@ pub fn allocate_memory<const P: usize, const S: usize>(
   })
 }
 
-pub fn allocate_and_bind_memory<const P: usize, const S: usize>(
+pub fn allocate_and_bind_memory<const P: usize>(
   device: &Device,
   physical_device: &PhysicalDevice,
   mem_props: [vk::MemoryPropertyFlags; P],
-  objs: [&dyn MemoryBound; S],
+  objs: &[&dyn MemoryBound],
   priority: f32, // only set if VK_EXT_memory_priority is enabled
   align_objects_to_non_coherent_atom_size: bool,
-  #[cfg(feature = "log_alloc")] obj_labels: Option<[&'static str; S]>,
+  #[cfg(feature = "log_alloc")] obj_labels: Option<&[&'static str]>,
   #[cfg(feature = "log_alloc")] allocation_name: &str,
-) -> Result<AllocationSuccess<S>, AllocationError> {
+) -> Result<AllocationSuccess, AllocationError> {
+  let mut obj_reqs: Vec<vk::MemoryRequirements> =
+    unsafe { objs.iter().map(|obj| obj.get_memory_requirements(device)) }.collect();
+
   let alloc = allocate_memory(
     device,
     physical_device,
     mem_props,
-    objs,
+    &mut obj_reqs,
     priority,
     align_objects_to_non_coherent_atom_size,
     #[cfg(feature = "log_alloc")]
@@ -327,15 +333,15 @@ pub fn allocate_and_bind_memory<const P: usize, const S: usize>(
   Ok(alloc)
 }
 
-pub fn allocate_and_map_host_memory<const P: usize, const S: usize>(
+pub fn allocate_and_map_host_memory<const P: usize>(
   device: &Device,
   physical_device: &PhysicalDevice,
   mem_props: [vk::MemoryPropertyFlags; P],
-  objs: [&dyn MemoryBound; S],
+  objs: &[&dyn MemoryBound],
   priority: f32, // only set if VK_EXT_memory_priority is enabled
-  #[cfg(feature = "log_alloc")] obj_labels: Option<[&'static str; S]>,
+  #[cfg(feature = "log_alloc")] obj_labels: Option<&[&'static str]>,
   #[cfg(feature = "log_alloc")] allocation_name: &str,
-) -> Result<(AllocationSuccess<S>, [MappedHostObject; S]), HostAllocationError> {
+) -> Result<(AllocationSuccess, Vec<MappedHostObject>), HostAllocationError> {
   for prop in mem_props {
     if !prop.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
       return Err(HostAllocationError::NoHostVisibleBit);
@@ -356,18 +362,17 @@ pub fn allocate_and_map_host_memory<const P: usize, const S: usize>(
   )?;
 
   let mapped_ptrs = map_host_visible_allocation(device, &alloc)?;
-  let objects = MappedHostObject::from_allocation(physical_device, &alloc, &objs, mapped_ptrs);
+  let objects = MappedHostObject::from_allocation(physical_device, &alloc, &objs, &mapped_ptrs);
 
   Ok((alloc, objects))
 }
 
 /// allocation must have had the HOST_VISIBLE property flag
-pub fn map_host_visible_allocation<const S: usize>(
+pub fn map_host_visible_allocation(
   device: &Device,
-  allocation: &AllocationSuccess<S>,
-) -> Result<[NonNull<u8>; S], MemoryMapError> {
-  let mut pointers = [NonNull::dangling(); S];
-  let mut assigned_count = 0;
+  allocation: &AllocationSuccess,
+) -> Result<Vec<NonNull<u8>>, MemoryMapError> {
+  let mut pointers = vec![NonNull::dangling(); allocation.obj_to_memory_assignment.len()];
   for (cur_memory_i, memory) in allocation.get_memories().iter().enumerate() {
     let mem_ptr =
       unsafe { device.map_memory(**memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?
@@ -385,10 +390,8 @@ pub fn map_host_visible_allocation<const S: usize>(
       if cur_memory_i == obj_memory_i {
         pointers[obj_i] = NonNull::new(unsafe { mem_ptr.byte_add(memory_offset as usize) })
           .expect("Vulkan device.map_memory() returned a null pointer");
-        assigned_count += 1;
       }
     }
-    assert_eq!(assigned_count, S);
   }
 
   Ok(pointers)

@@ -107,7 +107,7 @@ pub unsafe fn create_single_use_staging_buffers<const S: usize>(
       vk::MemoryPropertyFlags::HOST_VISIBLE.bitor(vk::MemoryPropertyFlags::HOST_COHERENT),
       vk::MemoryPropertyFlags::HOST_VISIBLE,
     ],
-    trait_objs,
+    &trait_objs,
     0.5,
     #[cfg(feature = "log_alloc")]
     None,

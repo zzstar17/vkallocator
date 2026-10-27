@@ -6,9 +6,9 @@ use super::mem_type_assignment::{
   UnassignedToMemoryObjectsData, assign_memory_type_indexes_to_objects_for_allocation,
 };
 
-use vkinitialization::device::{Device, PhysicalDevice};
+use vkinitialization::device::PhysicalDevice;
 
-use super::{MemoryBound, mem_type_assignment::MemoryAssignmentError};
+use super::mem_type_assignment::MemoryAssignmentError;
 
 fn digit_count(mut n: usize) -> usize {
   if n == 0 {
@@ -217,9 +217,9 @@ pub fn debug_print_device_memory_info(
   Ok(())
 }
 
-pub fn display_mem_assignment_result<const P: usize, const S: usize>(
+pub fn display_mem_assignment_result<const P: usize>(
   f: &mut dyn fmt::Write,
-  result: Result<([usize; S], usize), MemoryAssignmentError>,
+  result: &Result<(Vec<usize>, usize), MemoryAssignmentError>,
   alloc_name: &str,
   mem_types: &[vk::MemoryType],
   mem_props: &[vk::MemoryPropertyFlags],
@@ -234,7 +234,7 @@ pub fn display_mem_assignment_result<const P: usize, const S: usize>(
         obj_reqs.len(),
         if obj_reqs.len() == 1 { "" } else { "s" },
         unique_type_count,
-        if unique_type_count == 1 { "" } else { "s" }
+        if *unique_type_count == 1 { "" } else { "s" }
       ))?;
       write_properties_table(
         f,
@@ -283,21 +283,19 @@ pub fn display_mem_assignment_result<const P: usize, const S: usize>(
 
 // don't allocate memory, just print possible mem assignments
 #[allow(dead_code)]
-pub fn debug_print_possible_memory_type_assignment<const P: usize, const S: usize>(
-  device: &Device,
+pub fn debug_print_possible_memory_type_assignment<const P: usize>(
   physical_device: &PhysicalDevice,
   mem_props: [vk::MemoryPropertyFlags; P],
-  objs: [&dyn MemoryBound; S],
-  obj_labels: Option<[&'static str; S]>,
+  obj_reqs: &[vk::MemoryRequirements],
+  obj_labels: Option<&[&'static str]>,
   allocation_name: Option<&str>,
 ) -> fmt::Result {
   let mut output = String::new();
   let mem_types = physical_device.memory_types();
-  let obj_reqs = unsafe { objs.map(|obj| obj.get_memory_requirements(device)) };
 
   output.write_fmt(format_args!(
     "\nFinding possible allocation configuration for {} objects:\n",
-    objs.len()
+    obj_reqs.len()
   ))?;
 
   let result =
@@ -307,15 +305,14 @@ pub fn debug_print_possible_memory_type_assignment<const P: usize, const S: usiz
       obj_reqs,
       obj_labels,
     });
-  let labels = obj_labels.as_ref().map(|labels_arr| labels_arr.as_slice());
-  display_mem_assignment_result::<P, S>(
+  display_mem_assignment_result::<P>(
     &mut output,
-    result,
+    &result,
     allocation_name.unwrap_or("DUMMY MEMORY ASSIGNMENT"),
     mem_types,
     &mem_props,
     &obj_reqs,
-    labels,
+    obj_labels,
   )
   .unwrap();
 

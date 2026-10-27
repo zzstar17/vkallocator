@@ -49,23 +49,16 @@ pub struct MappedHostObject {
 }
 
 impl MappedHostObject {
-  pub fn from_allocation<const S: usize>(
+  pub fn from_allocation(
     physical_device: &PhysicalDevice,
-    allocation: &AllocationSuccess<S>,
-    objs: &[&dyn MemoryBound; S],
-    mapped_ptrs: [NonNull<u8>; S],
-  ) -> [Self; S] {
-    // can't transmute between S sized arrays so no MaybeUninit this time
-    let default = Self {
-      handle: 0,
-      object_type: MemoryBoundType::Buffer,
-      data_ptr: NonNull::dangling(),
-      memory: vk::DeviceMemory::null(),
-      mem_host_coherent: false,
-      obj_offset: 0,
-      obj_size: 0,
-    };
-    let mut result = [default; S];
+    allocation: &AllocationSuccess,
+    objs: &[&dyn MemoryBound],
+    mapped_ptrs: &[NonNull<u8>],
+  ) -> Vec<Self> {
+    assert_eq!(objs.len(), mapped_ptrs.len());
+    assert_eq!(objs.len(), allocation.obj_to_memory_assignment.len());
+
+    let mut result = Vec::with_capacity(objs.len());
 
     let memory_types = physical_device.memory_types();
     let memories = allocation.get_memories();
@@ -103,7 +96,7 @@ impl MappedHostObject {
         obj_size: memory_placement.object_size,
       };
 
-      result[i] = obj;
+      result.push(obj);
     }
 
     result

@@ -1,7 +1,7 @@
 use ash::vk;
 
 #[derive(Debug)]
-pub struct UnassignedToMemoryObjectsData<'a, const P: usize, const S: usize> {
+pub struct UnassignedToMemoryObjectsData<'a, const P: usize> {
   /// Physical's device memory types
   /// Contains heap index and supported memory properties
   pub mem_types: &'a [vk::MemoryType],
@@ -9,27 +9,21 @@ pub struct UnassignedToMemoryObjectsData<'a, const P: usize, const S: usize> {
   pub mem_props: [vk::MemoryPropertyFlags; P],
   /// Memory requirements from each object
   /// Each object is only supported in a set of memory types
-  pub obj_reqs: [vk::MemoryRequirements; S],
+  pub obj_reqs: &'a [vk::MemoryRequirements],
   #[cfg(feature = "log_alloc")]
-  pub obj_labels: Option<[&'static str; S]>,
+  pub obj_labels: Option<&'a [&'static str]>,
 }
 
 #[cfg(feature = "log_alloc")]
-impl<'a, const P: usize, const S: usize> std::fmt::Display
-  for UnassignedToMemoryObjectsData<'a, P, S>
-{
+impl<'a, const P: usize> std::fmt::Display for UnassignedToMemoryObjectsData<'a, P> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    let labels = self
-      .obj_labels
-      .as_ref()
-      .map(|labels_arr| labels_arr.as_slice());
     super::logging::write_properties_table(
       f,
       self.mem_types,
       &self.mem_props,
       &self.obj_reqs,
       None,
-      labels,
+      self.obj_labels,
     )
   }
 }
@@ -50,9 +44,9 @@ pub enum MemoryAssignmentError {
 /// Returns assigned memory types for each object and the total number of unique memory types
 ///
 /// todo: doesn't test if requirements exceed memory heap capacity
-pub fn assign_memory_type_indexes_to_objects_for_allocation<const P: usize, const S: usize>(
-  data: UnassignedToMemoryObjectsData<P, S>,
-) -> Result<([usize; S], usize), MemoryAssignmentError> {
+pub fn assign_memory_type_indexes_to_objects_for_allocation<const P: usize>(
+  data: UnassignedToMemoryObjectsData<P>,
+) -> Result<(Vec<usize>, usize), MemoryAssignmentError> {
   // note: memory types bitmask in vulkan are ordered from right to left, so the first type index
   // is the last bit (so bitmask & 1 > 0 tests if the first type is compatible)
 
@@ -75,7 +69,7 @@ pub fn assign_memory_type_indexes_to_objects_for_allocation<const P: usize, cons
   }
 
   // write final choice masks for objects
-  let mut object_masks = [0; S];
+  let mut object_masks = vec![0; data.obj_reqs.len()];
   for (i, requirements) in data.obj_reqs.iter().enumerate() {
     for supported in supported_properties {
       let this_supported = requirements.memory_type_bits & supported;
@@ -94,7 +88,7 @@ pub fn assign_memory_type_indexes_to_objects_for_allocation<const P: usize, cons
 
   // count how many of each type the objects support
   let mut memory_type_counters = [0usize; vk::MAX_MEMORY_TYPES];
-  for mask in object_masks {
+  for mask in object_masks.iter() {
     for i in 0..(data.mem_types.len()) {
       if mask & (1 << i) > 0 {
         memory_type_counters[i] += 1
@@ -102,8 +96,8 @@ pub fn assign_memory_type_indexes_to_objects_for_allocation<const P: usize, cons
     }
   }
 
-  let mut assigned = [usize::MAX; S];
-  let mut remaining = S;
+  let mut assigned = vec![usize::MAX; data.obj_reqs.len()];
+  let mut remaining = data.obj_reqs.len();
   let mut unique_type_count = 0;
   // choose the first type with the highest amount of objects and add assign them
   // repeat until all objects are assigned
